@@ -90,10 +90,10 @@ class TradingEnv:
         denominator = (self.B_t - self.A_t**2) ** (3 / 2)
         dsr = numerator / denominator if denominator > 0 else 0  # 📊 Zapobieganie dzieleniu przez zero
  
-        alfa = 0.1
+        alfa = 0.5
         
         # 🎯 Ustawiamy nagrodę równą zwrotowi
-        reward = R_t + dsr * alfa
+        reward = dsr + R_t * alfa
 
 
         self.history.append(new_value)

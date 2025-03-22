@@ -1,62 +1,58 @@
-import random
 import numpy as np
+import random
+from collections import deque
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from collections import deque
-from model import DQN  # Sieć neuronowa
+from model import Actor, Critic
 
-class DQNAgent:
-    def __init__(self, 
-                 state_size, 
-                 action_size, 
-                 gamma=0.99, 
-                 lr=0.001, 
-                 batch_size=128, 
-                 epsilon=1.0, 
-                 epsilon_decay=0.999, 
-                 epsilon_min=0.1, 
-                 tau=0.005):
+class DDPGAgent:
+    def __init__(self, state_size, action_size, gamma=0.99, tau=0.005, lr_actor=1e-4, lr_critic=1e-3, batch_size=128):
         self.state_size = state_size
         self.action_size = action_size
-        self.gamma = gamma  # Współczynnik dyskontowania przyszłych nagród
-        self.lr = lr  # Learning rate
+        self.gamma = gamma
+        self.tau = tau
         self.batch_size = batch_size
-        self.epsilon = epsilon  # Początkowa eksploracja
-        self.epsilon_decay = epsilon_decay  # Stopniowa redukcja epsilon
-        self.epsilon_min = epsilon_min  # Minimalna eksploracja
-        self.tau = tau  # 🆕 Współczynnik do soft update w Double DQN
-        self.memory = deque(maxlen=15000)  # 🆕 Powiększony Replay Buffer
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        # 🏗 Tworzymy dwie sieci neuronowe
-        self.model = DQN(state_size, action_size).to(self.device)  # Sieć główna
-        self.target_model = DQN(state_size, action_size).to(self.device)  # Sieć docelowa
-        self.target_model.load_state_dict(self.model.state_dict())  # Kopiujemy wagi
-        self.target_model.eval()  # Sieć docelowa tylko do ewaluacji
+        # Actor
+        self.actor = Actor(state_size, action_size).to(self.device)
+        self.target_actor = Actor(state_size, action_size).to(self.device)
+        self.target_actor.load_state_dict(self.actor.state_dict())
+        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=lr_actor)
 
-        self.optimizer = optim.Adam(self.model.parameters(), lr=self.lr)
+        # Critic
+        self.critic = Critic(state_size, action_size).to(self.device)
+        self.target_critic = Critic(state_size, action_size).to(self.device)
+        self.target_critic.load_state_dict(self.critic.state_dict())
+        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=lr_critic)
+
+        # Replay buffer
+        self.memory = deque(maxlen=20000)
+
+        # Szum eksploracyjny
+        self.noise_std = 0.2  # Gaussowski
+        self.noise_clip = 0.5
+
         self.loss_fn = nn.MSELoss()
 
-    def remember(self, state, action, reward, next_state, done):
-        """Przechowywanie doświadczeń w pamięci Replay Buffer"""
-        self.memory.append((state, action, reward, next_state, done))
-        
-        
-    def act(self, state):
-        """Wybór akcji zgodnie z polityką epsilon-greedy"""
-        if np.random.rand() <= self.epsilon:
-            return np.random.uniform(-1, 1, self.action_size)  # 🏆 Eksploracja daje wartości w zakresie (-1,1)
-        
+    def act(self, state, add_noise=True):
         state = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+        self.actor.eval()
         with torch.no_grad():
-            q_values = self.model(state)
-        
-        return q_values.cpu().numpy().squeeze()  # 🏆 Model może zwrócić wartości pośrednie
+            action = self.actor(state).cpu().data.numpy().squeeze()
+        self.actor.train()
 
+        if add_noise:
+            noise = np.clip(np.random.normal(0, self.noise_std, size=self.action_size), -self.noise_clip, self.noise_clip)
+            action += noise
+
+        return np.clip(action, -1, 1)
+
+    def remember(self, state, action, reward, next_state, done):
+        self.memory.append((state, action, reward, next_state, done))
 
     def replay(self):
-        """Trenuj model na losowo wybranych doświadczeniach z pamięci Replay Buffer"""
         if len(self.memory) < self.batch_size:
             return
 
@@ -64,49 +60,47 @@ class DQNAgent:
         states, actions, rewards, next_states, dones = zip(*batch)
 
         states = torch.FloatTensor(np.array(states)).to(self.device)
-        actions = torch.FloatTensor(np.array(actions)).to(self.device)  # 🏆 Akcje są ciągłe!
-        rewards = torch.FloatTensor(np.array(rewards)).unsqueeze(1).to(self.device)  # 🏆 Dopasowanie wymiaru [batch_size, 1]
+        actions = torch.FloatTensor(np.array(actions)).to(self.device)
+        rewards = torch.FloatTensor(np.array(rewards)).unsqueeze(1).to(self.device)
         next_states = torch.FloatTensor(np.array(next_states)).to(self.device)
-        dones = torch.FloatTensor(np.array(dones)).unsqueeze(1).to(self.device)  # 🏆 Konwersja na [batch_size, 1]
+        dones = torch.FloatTensor(np.array(dones)).unsqueeze(1).to(self.device)
 
-        # 🏆 Obliczamy przewidywane wartości Q dla obecnego stanu
-        q_values = self.model(states)
+        # 🎯 Krytyk
+        next_actions = self.target_actor(next_states)
+        next_q_values = self.target_critic(next_states, next_actions).detach()
+        target_q = rewards + (1 - dones) * self.gamma * next_q_values
 
-        # 🏆 Obliczamy wartości Q dla następnych stanów (ale bez gradientów)
-        next_q_values = self.target_model(next_states).detach()  # 🏆 Bez użycia `.max()`, bo mamy akcje ciągłe
+        current_q = self.critic(states, actions)
+        critic_loss = self.loss_fn(current_q, target_q)
 
-        # 🏆 Aktualizacja wartości Q przy użyciu Bellmana
-        target_q_values = rewards + (1 - dones) * self.gamma * next_q_values  # 🏆 Bellman Equation
+        self.critic_optimizer.zero_grad()
+        critic_loss.backward()
+        self.critic_optimizer.step()
 
-        # 🏆 Upewniamy się, że wymiary pasują do MSELoss
-        loss = self.loss_fn(q_values, target_q_values)
-        
-        #print(f"🔍 q_values.shape: {q_values.shape}, target_q_values.shape: {target_q_values.shape}")
+        # 🎯 Aktor (maksymalizujemy Q)
+        predicted_actions = self.actor(states)
+        actor_loss = -self.critic(states, predicted_actions).mean()
 
-        self.optimizer = optim.Adam(self.model.parameters(), lr=0.0001)
+        self.actor_optimizer.zero_grad()
+        actor_loss.backward()
+        self.actor_optimizer.step()
 
-        loss.backward()
-        self.optimizer.step()
+        # 🔄 Soft update sieci docelowych
+        self.soft_update(self.target_actor, self.actor)
+        self.soft_update(self.target_critic, self.critic)
 
-        # Stopniowe zmniejszanie epsilon (eksploracja)
-        if self.epsilon > self.epsilon_min:
-            self.epsilon *= self.epsilon_decay
-            
-            
-    def update_target_network(self):
-        """Soft update sieci docelowej"""
-        for target_param, param in zip(self.target_model.parameters(), self.model.parameters()):
+    def soft_update(self, target_net, source_net):
+        for target_param, param in zip(target_net.parameters(), source_net.parameters()):
             target_param.data.copy_(self.tau * param.data + (1.0 - self.tau) * target_param.data)
 
+    def save_model(self, actor_path="ddpg_actor.pth", critic_path="ddpg_critic.pth"):
+        torch.save(self.actor.state_dict(), actor_path)
+        torch.save(self.critic.state_dict(), critic_path)
+        print(f"✅ Modele zapisane: {actor_path}, {critic_path}")
 
-    def save_model(self, filename="dqn_trading_model.pth"):
-        """Zapisuje model do pliku"""
-        torch.save(self.model.state_dict(), filename)
-        print(f"✅ Model zapisany jako {filename}")
-
-
-    def load_model(self, filename="dqn_trading_model.pth"):
-        """Wczytuje model z pliku"""
-        self.model.load_state_dict(torch.load(filename))
-        self.model.eval()  # Tryb ewaluacji
-        print(f"🔄 Model wczytany z {filename}")
+    def load_model(self, actor_path="ddpg_actor.pth", critic_path="ddpg_critic.pth"):
+        self.actor.load_state_dict(torch.load(actor_path))
+        self.critic.load_state_dict(torch.load(critic_path))
+        self.actor.eval()
+        self.critic.eval()
+        print(f"🔄 Modele wczytane z: {actor_path}, {critic_path}")
